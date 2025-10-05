@@ -76,6 +76,39 @@ class AIMemoryChatbot:
             self.client = None
             print("NOTE: OpenAI API not available. Using simple response generation.")
     
+    def _extract_keywords(self, text: str) -> List[str]:
+        """Extract important keywords from text for memory searching"""
+        # Remove punctuation and convert to lowercase
+        text = re.sub(r'[^\w\s]', ' ', text.lower())
+        words = text.split()
+        
+        # Remove common stop words
+        stop_words = {
+            "the", "a", "an", "and", "or", "but", "if", "because", "as", "what",
+            "when", "where", "how", "who", "which", "this", "that", "these", "those",
+            "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+            "do", "does", "did", "to", "at", "in", "on", "by", "for", "with", "about",
+            "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them"
+        }
+        keywords = [word for word in words if word not in stop_words and len(word) > 2]
+        
+        # Get noun phrases and important terms (simplified approach)
+        important_words = []
+        for i, word in enumerate(keywords):
+            # Check for capitalized words (likely proper nouns)
+            if word[0].isupper() and i > 0:
+                important_words.append(word)
+            
+            # Check for numbers (likely important quantities, dates, etc.)
+            if any(char.isdigit() for char in word):
+                important_words.append(word)
+        
+        # Combine unique keywords and important words
+        all_keywords = list(set(keywords + important_words))
+        
+        # Return top keywords by length (longer words often more specific)
+        return sorted(all_keywords, key=len, reverse=True)[:5]
+    
     def add_to_memory(self, message: str, metadata: Dict[str, Any] = None) -> None:
         """Add user message to short-term memory with appropriate metadata"""
         if metadata is None:
@@ -127,34 +160,120 @@ class AIMemoryChatbot:
         # Increment feedback counter
         self.user_feedback_count += 1
         
-        # Every 5 feedback instances, update the prioritizer's model
+        # Every 5 feedback instances, update the prioritizer's model and summarize conversation
         if self.user_feedback_count % 5 == 0:
             self.memory.prioritizer.update_target_network()
+            self._summarize_conversation()
+            
+    def _summarize_conversation(self):
+        """Summarize recent conversation and add important insights to memory"""
+        if len(self.conversation_history) < 4 or self.client is None:  # Need enough context to summarize
+            return
+            
+        # Get the last 10 exchanges
+        recent_history = self.conversation_history[-min(10, len(self.conversation_history)):]
+        
+        # Format conversation for summarization
+        conversation_text = "\n".join([
+            f"{msg['role'].upper()}: {msg['content']}" for msg in recent_history
+        ])
+        
+        try:
+            # Create a request to summarize the conversation
+            summary_request = self.client.chat.completions.create(
+                model="gpt-5",
+                messages=[{
+                    "role": "system",
+                    "content": """Analyze this conversation and extract 1-3 important facts or preferences that should be remembered.
+                    Focus on:
+                    1. User preferences and personal details
+                    2. Facts the user has shared
+                    3. Important context that would be helpful for future interactions
+                    
+                    Format each point as a clear, concise statement. Don't include things the assistant already knows as part of its training."""
+                }, {
+                    "role": "user",
+                    "content": f"CONVERSATION TO ANALYZE:\n{conversation_text}"
+                }],
+                max_tokens=150
+            )
+            
+            summary = summary_request.choices[0].message.content
+            
+            # Add summary points to memory with high priority
+            for point in summary.split('\n'):
+                if point.strip():
+                    self.memory.add_memory(
+                        point.strip(), 
+                        {"is_fact": 1.0, "is_summary": 1.0}
+                    )
+                    
+        except Exception as e:
+            print(f"Error summarizing conversation: {str(e)}")
     
     def generate_response(self, user_message: str) -> str:
         """Generate response based on user message and memory"""
         # Add user message to memory first
         self.add_to_memory(user_message)
         
-        # Get relevant memories for context
-        relevant_memories = self.memory.search(user_message)
-        if not relevant_memories:
-            relevant_memories = self.memory.get_memories()[:3]  # Get top 3 by priority
+        # Get relevant memories using a multi-strategy approach:
+        # 1. Exact content match
+        content_matches = self.memory.search(user_message)
         
-        # Create context from memories
-        memory_context = "\n".join([f"- {mem.content}" for mem in relevant_memories])
+        # 2. Keyword-based search for important terms
+        keywords = self._extract_keywords(user_message)
+        keyword_matches = []
+        for keyword in keywords:
+            keyword_matches.extend(self.memory.search(keyword))
+        
+        # 3. Get top memories by priority
+        priority_memories = self.memory.get_memories()[:5]  # Get top 5 by priority
+        
+        # Combine and deduplicate memories
+        all_memories = []
+        memory_ids = set()
+        
+        for mem_list in [content_matches, keyword_matches, priority_memories]:
+            for mem in mem_list:
+                mem_id = hash(mem.content)
+                if mem_id not in memory_ids:
+                    all_memories.append(mem)
+                    memory_ids.add(mem_id)
+        
+        # Sort final memories by priority
+        relevant_memories = sorted(all_memories, key=lambda x: x.priority, reverse=True)[:7]  # Limit to 7 most relevant
+        
+        # Record access for these memories to increase their priority
+        for mem in relevant_memories:
+            mem.access()
+            
+        # Create structured context from memories with importance indicators
+        memory_entries = []
+        for i, mem in enumerate(relevant_memories):
+            importance = "High" if mem.priority > 0.7 else "Medium" if mem.priority > 0.4 else "Low"
+            memory_entries.append(f"[Memory {i+1} - {importance} Priority]: {mem.content}")
+            
+        memory_context = "\n".join(memory_entries)
         
         if self.client:  # If OpenAI is available
             try:
-                # Create prompt with memory context
+                # Create prompt with memory context and clear instructions
                 messages = [
                     {"role": "system", "content": f"""You are a helpful assistant with short-term memory. 
-                    Use the following relevant information from your memory to inform your response:
+                    Your strength is remembering important details from previous conversations.
                     
+                    SHORT-TERM MEMORY CONTEXT:
                     {memory_context}
                     
-                    If the memory contains relevant information, use it in your response.
-                    If not, respond based on your general knowledge."""},
+                    INSTRUCTIONS:
+                    1. ALWAYS reference information from your memory when relevant to the user's query
+                    2. Explicitly refer to memories with phrases like "As I recall..." or "Based on our previous conversation..."
+                    3. If multiple memories conflict, prioritize those with "High Priority" labels
+                    4. If no memories are relevant, respond based on your general knowledge
+                    5. Do not mention "memories" or "priority" directly - integrate information naturally
+                    
+                    Your goal is to provide a personalized, consistent experience that demonstrates you remember 
+                    previous interactions and important information the user has shared."""},
                     {"role": "user", "content": user_message}
                 ]
                 
@@ -163,11 +282,10 @@ class AIMemoryChatbot:
                 for item in history_subset:
                     messages.append({"role": item["role"], "content": item["content"]})
                 
-                # Generate response using OpenAI
+                # Generate response using GPT-5
                 response = self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="gpt-5",
                     messages=messages,
-                    max_tokens=150
                 )
                 
                 response_text = response.choices[0].message.content
@@ -234,6 +352,52 @@ class AIMemoryChatbot:
         """Load the memory state from file"""
         self.memory.load(filepath)
         print(f"Memory state loaded from {filepath}")
+        
+    def visualize_memory(self, detailed=False):
+        """Display current memory contents with priority visualization"""
+        memories = self.memory.get_memories()
+        
+        if not memories:
+            print("Memory is empty.")
+            return
+            
+        print("\n===== MEMORY VISUALIZATION =====")
+        print(f"Total memories: {len(memories)}")
+        print("Memory capacity:", self.memory.max_size)
+        print()
+        
+        # Display memories in order of priority
+        for i, memory in enumerate(memories):
+            # Create a visual bar representing priority
+            bar_length = int(memory.priority * 20)
+            priority_bar = "█" * bar_length + "░" * (20 - bar_length)
+            
+            # Format metadata indicators
+            metadata_tags = []
+            if memory.metadata.get("is_question", 0) > 0.5:
+                metadata_tags.append("Q")
+            if memory.metadata.get("is_instruction", 0) > 0.5:
+                metadata_tags.append("I")
+            if memory.metadata.get("is_fact", 0) > 0.5:
+                metadata_tags.append("F")
+            if memory.metadata.get("is_summary", 0) > 0.5:
+                metadata_tags.append("S")
+            
+            metadata_str = f"[{' '.join(metadata_tags)}]" if metadata_tags else ""
+            
+            # Print memory entry with priority bar
+            print(f"{i+1}. {priority_bar} {memory.priority:.2f} {metadata_str}")
+            print(f"   {memory.content[:100]}{'...' if len(memory.content) > 100 else ''}")
+            
+            # Print detailed info if requested
+            if detailed:
+                age = (time.time() - memory.timestamp) / 86400  # Age in days
+                print(f"   Age: {age:.1f} days | Access count: {memory.access_count}")
+                print(f"   Last accessed: {time.time() - memory.last_accessed:.1f} seconds ago")
+                print(f"   Full metadata: {memory.metadata}")
+            print()
+        
+        print("================================")
 
 
 # Interactive chat loop for testing the chatbot
@@ -247,6 +411,8 @@ def interactive_chat(api_key=None):
     print("- Type 'clear memory' to clear the chatbot's memory")
     print("- Type 'save memory' to save the current memory state")
     print("- Type 'load memory' to load a previously saved memory state")
+    print("- Type 'show memory' to visualize current memory contents")
+    print("- Type 'show memory details' for detailed memory visualization")
     print("================================\n")
     
     while True:
@@ -270,6 +436,14 @@ def interactive_chat(api_key=None):
             chatbot.load_state(filepath)
             continue
         
+        elif user_input.lower() == "show memory":
+            chatbot.visualize_memory()
+            continue
+            
+        elif user_input.lower() == "show memory details":
+            chatbot.visualize_memory(detailed=True)
+            continue
+        
         elif user_input.lower().startswith("feedback:"):
             feedback = user_input[9:].strip()  # Extract the feedback text
             chatbot.process_feedback(feedback)
@@ -281,12 +455,19 @@ def interactive_chat(api_key=None):
 
 
 if __name__ == "__main__":
-    # If you have an OpenAI API key, replace None with your API key as a string
-    api_key = "YOUR-API-KEY"
+    # Try to get API key from environment variable for security
+    import os
+    from dotenv import load_dotenv
+    
+    # Load API key from .env file if available
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY", None)
+    
+    # Warn if dependencies are missing
     if not OPENAI_AVAILABLE:
         print("OpenAI package not found. You can install it with: pip install openai")
     if not TEXTBLOB_AVAILABLE:
         print("TextBlob package not found. You can install it with: pip install textblob")
     
     # Start interactive chat
-    interactive_chat(api_key)
+    interactive_chat(api_key = "YOUR-API-KEY")
